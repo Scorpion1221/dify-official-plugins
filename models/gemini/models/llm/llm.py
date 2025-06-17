@@ -230,10 +230,16 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
         config.temperature = model_parameters.get("temperature", None)
         config.max_output_tokens = model_parameters.get("max_output_tokens", None)
 
-        config.thinking_config = types.ThinkingConfig(
-            include_thoughts=model_parameters.get("thinking", False),
-            thinking_budget=model_parameters.get("thinking_budget", 128),
-        )
+        thinking_config_params = {}
+
+        if model_parameters.get("thinking") is not None:
+            thinking_config_params["include_thoughts"] = model_parameters.pop("thinking")
+
+        if model_parameters.get("thinking_budget") is not None:
+            thinking_config_params["thinking_budget"] = model_parameters.pop("thinking_budget")
+
+        if thinking_config_params:  # 只有当有参数需要设置时才创建配置
+            config.thinking_config = types.ThinkingConfig(**thinking_config_params)
 
         config.tools = []
         if model_parameters.get("grounding"):
