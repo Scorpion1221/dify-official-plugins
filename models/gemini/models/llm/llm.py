@@ -230,6 +230,11 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
         config.temperature = model_parameters.get("temperature", None)
         config.max_output_tokens = model_parameters.get("max_output_tokens", None)
 
+        config.thinking_config = types.ThinkingConfig(
+            include_thoughts=model_parameters.get("thinking", False),
+            thinking_budget=model_parameters.get("thinking_budget", 128),
+        )
+
         config.tools = []
         if model_parameters.get("grounding"):
             config.tools.append(types.Tool(google_search=types.GoogleSearch()))
@@ -474,6 +479,7 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
         prompt_tokens = 0
         completion_tokens = 0
         for chunk in response:
+            # print(chunk)
             if not chunk.candidates:
                 continue
             for candidate in chunk.candidates:
