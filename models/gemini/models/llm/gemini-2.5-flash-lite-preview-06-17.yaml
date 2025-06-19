@@ -1,7 +1,7 @@
-# https://ai.google.dev/gemini-api/docs/models?hl=zh-cn#gemini-2.5-pro-preview-03-25
-model: gemini-2.5-pro-preview-03-25
+# https://ai.google.dev/gemini-api/docs/models#gemini-2.5-flash-preview
+model: gemini-2.5-flash-lite-preview-06-17
 label:
-  en_US: Gemini 2.5 Pro Preview 03-25
+  en_US: Gemini 2.5 Flash Lite Preview 06-17
 model_type: llm
 features:
   - agent-thought
@@ -13,30 +13,40 @@ features:
   - audio
 model_properties:
   mode: chat
-  context_size: 1048576
+  context_size: 1000000
 parameter_rules:
+  - name: thinking_mode
+    label:
+      zh_Hans: 推理模式
+      en_US: Thinking Mode
+    type: boolean
+    default: false
+    required: false
+    help:
+      zh_Hans: 控制模型的推理模式。
+      en_US: Controls the model's thinking mode.
   - name: thinking_summary
     label:
-      zh_Hans: 思考摘要
+      zh_Hans: 推理摘要
       en_US: Thinking Summary
     type: boolean
     default: false
     required: false
     help:
-      zh_Hans: 控制模型的思考摘要是否展示。
+      zh_Hans: 控制模型的推理摘要是否展示。
       en_US: Controls the model's thinking summary display.
   - name: thinking_budget
     label:
       zh_Hans: 推理预算
       en_US: Thinking Budget
     type: int
-    default: 128
-    min: 128
-    max: 32768
+    default: 1024
+    min: 512
+    max: 24576
     required: false
     help:
-      zh_Hans: 推理的预算限制（最小128），必须小于max_tokens。仅在推理模式启用时可用。
-      en_US: Budget limit for thinking (minimum 128), must be less than max_tokens. Only available when thinking mode is enabled.
+      zh_Hans: 推理的预算限制（0是停用内部思考），必须小于max_tokens。
+      en_US: Budget limit for thinking (0 is disable internal thinking), must be less than max_tokens.
   - name: temperature
     use_template: temperature
     default: 1
@@ -57,23 +67,21 @@ parameter_rules:
     use_template: max_tokens
     default: 8192
     min: 1
-    max: 65536
+    max: 64000
+  - name: json_schema
+    use_template: json_schema
   - name: grounding
     label:
       en_US: Grounding
-      zh_Hans: 事实核查
-      ja_JP: 事実チェック
+      ja_JP: Grounding
     type: boolean
     help:
-      en_US: Grounding with Google Search
-      zh_Hans: Google 事实核查
+      en_US: ensures responses are based on Google Search.
       ja_JP: Google検索に基づいた応答をします。
     required: true
     default: false
-  - name: json_schema
-    use_template: json_schema
 pricing:
-  input: '1.25'
-  output: '10.00'
+  input: '0.10'
+  output: '0.40'
   unit: '0.000001'
   currency: USD

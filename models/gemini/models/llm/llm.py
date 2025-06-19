@@ -232,8 +232,15 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
 
         thinking_config_params = {}
 
-        if model_parameters.get("thinking") is not None:
-            thinking_config_params["include_thoughts"] = model_parameters.pop("thinking")
+        if model_parameters.get("thinking_mode") is not None:
+            thinking_mode = model_parameters.pop("thinking_mode")
+            if thinking_mode:
+                thinking_config_params["thinking_budget"] = -1
+            else:
+                thinking_config_params["thinking_budget"] = 0
+
+        if model_parameters.get("thinking_summary") is not None:
+            thinking_config_params["include_thoughts"] = model_parameters.pop("thinking_summary")
 
         if model_parameters.get("thinking_budget") is not None:
             thinking_config_params["thinking_budget"] = model_parameters.pop("thinking_budget")
