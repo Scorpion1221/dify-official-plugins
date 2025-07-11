@@ -199,14 +199,22 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
         stream: bool = True,
         user: Optional[str] = None,
     ) -> Union[LLMResult, Generator[LLMResultChunk]]:
+        # Check for incompatible feature combinations
+        # Code execution can be combined with grounding but not with json_schema or tools
+        # Code execution enables the model to generate and run Python code for calculations and data analysis
+        has_json_schema = bool(model_parameters.get("json_schema"))
+        has_grounding = bool(model_parameters.get("grounding"))
+        has_code_execution = bool(model_parameters.get("code_execution"))
+        has_tools = bool(tools)
+        
         conditions: list[bool] = [
-            bool(model_parameters.get("json_schema")),
-            bool(model_parameters.get("grounding")),
-            bool(tools),
+            has_json_schema,
+            has_grounding and not has_code_execution,  # grounding can be combined with code_execution
+            has_tools,
         ]
         if sum(conditions) >= 2:
             raise InvokeError(
-                "gemini not support use multiple features at same time: json_schema, grounding, tools+knowledge"
+                "gemini not support use multiple features at same time: json_schema, grounding (without code_execution), tools+knowledge"
             )
         config = types.GenerateContentConfig()
         if system_instruction := self._get_system_instruction(prompt_messages=prompt_messages):
@@ -253,6 +261,8 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
         config.tools = []
         if model_parameters.get("grounding"):
             config.tools.append(types.Tool(google_search=types.GoogleSearch()))
+        if model_parameters.get("code_execution"):
+            config.tools.append(types.Tool(code_execution=types.ToolCodeExecution()))
         if tools:
             config.tools.append(self._convert_tools_to_glm_tool(tools))
 
@@ -586,6 +596,19 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
         for part in parts:
             if part.text:
                 contents.append(TextPromptMessageContent(data=part.text))
+            if part.executable_code:
+                # Handle executable code from code execution
+                executable_code = part.executable_code
+                code_text = f"\n\n```{executable_code.language.lower()}\n{executable_code.code}\n```\n\n"
+                contents.append(TextPromptMessageContent(data=code_text))
+            if part.code_execution_result:
+                # Handle code execution result
+                result = part.code_execution_result
+                if result.outcome == "OUTCOME_OK":
+                    result_text = f"Code execution result:\n```text\n{result.output}\n```\n\n"
+                else:
+                    result_text = f"Code execution failed ({result.outcome}):\n```text\n{result.output}\n```\n\n"
+                contents.append(TextPromptMessageContent(data=result_text))
             if part.function_call:
                 function_call = part.function_call
                 # Generate a unique ID since Gemini API doesn't provide one

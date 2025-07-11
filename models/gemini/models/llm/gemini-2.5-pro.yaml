@@ -70,6 +70,18 @@ parameter_rules:
       ja_JP: Google検索に基づいた応答をします。
     required: true
     default: false
+  - name: code_execution
+    label:
+      en_US: Code Execution
+      zh_Hans: 代码执行
+      ja_JP: コード実行
+    type: boolean
+    help:
+      en_US: Enable Python code execution for calculations and data analysis
+      zh_Hans: 启用 Python 代码执行功能，用于计算和数据分析
+      ja_JP: 計算とデータ分析のためのPythonコード実行を有効にします
+    required: false
+    default: false
   - name: json_schema
     use_template: json_schema
 # https://ai.google.dev/gemini-api/docs/pricing?hl=zh-cn#gemini-2.5-pro-preview
