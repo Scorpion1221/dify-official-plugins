@@ -26,9 +26,15 @@ from dify_plugin.interfaces.agent import (
 )
 from output_parser.cot_output_parser import CotAgentOutputParser
 from prompt.template import REACT_PROMPT_TEMPLATES
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 ignore_observation_providers = ["wenxin"]
+
+
+class ContextItem(BaseModel):
+    content: str
+    title: str
+    metadata: dict[str, Any]
 
 
 class ReActParams(BaseModel):
@@ -37,6 +43,7 @@ class ReActParams(BaseModel):
     model: AgentModelConfig
     tools: list[ToolEntity] | None
     maximum_iterations: int = 3
+    context: list[ContextItem] | None = None
 
 
 class AgentPromptEntity(BaseModel):
@@ -49,12 +56,10 @@ class AgentPromptEntity(BaseModel):
 
 
 class ReActAgentStrategy(AgentStrategy):
-    def __init__(self, session, runtime):
-        super().__init__(session, runtime)
-        self.query = ""
-        self.instruction = ""
-        self.history_prompt_messages = []
-        self.prompt_messages_tools = []
+    query: str = ""
+    instruction: str = ""
+    history_prompt_messages: list[PromptMessage] = Field(default_factory=list)
+    prompt_messages_tools: list[ToolEntity] = Field(default_factory=list)
 
     @property
     def _user_prompt_message(self) -> UserPromptMessage:
@@ -221,7 +226,7 @@ class ReActAgentStrategy(AgentStrategy):
             else:
                 usage_dict["usage"] = LLMUsage.empty_usage()
 
-            action = (
+            action_dict = (
                 scratchpad.action.to_dict()
                 if scratchpad.action
                 else {"action": scratchpad.agent_response}
@@ -229,7 +234,7 @@ class ReActAgentStrategy(AgentStrategy):
 
             yield self.finish_log_message(
                 log=model_log,
-                data={"thought": scratchpad.thought, **action},
+                data={"thought": scratchpad.thought, **action_dict},
                 metadata={
                     LogMetadata.STARTED_AT: model_started_at,
                     LogMetadata.FINISHED_AT: time.perf_counter(),
@@ -280,19 +285,20 @@ class ReActAgentStrategy(AgentStrategy):
                         status=ToolInvokeMessage.LogMessage.LogStatus.START,
                     )
                     yield tool_call_log
-                    tool_invoke_response, tool_invoke_parameters, additional_messages = (
-                        self._handle_invoke_action(
-                            action=scratchpad.action,
-                            tool_instances=tool_instances,
-                            message_file_ids=message_file_ids,
-                        )
+                    (
+                        tool_invoke_response,
+                        tool_invoke_parameters,
+                        additional_messages,
+                    ) = self._handle_invoke_action(
+                        action=scratchpad.action,
+                        tool_instances=tool_instances,
+                        message_file_ids=message_file_ids,
                     )
                     scratchpad.observation = tool_invoke_response
                     scratchpad.agent_response = tool_invoke_response
 
-                    # Yield any additional messages (like BLOB messages for files)
-                    for message in additional_messages:
-                        yield message
+                    # TODO: convert to agent invoke message
+                    yield from additional_messages
                     yield self.finish_log_message(
                         log=tool_call_log,
                         data={
@@ -348,6 +354,34 @@ class ReActAgentStrategy(AgentStrategy):
             iteration_step += 1
 
         yield self.create_text_message(final_answer)
+
+        # If context is a list of dict, create retriever resource message
+        if isinstance(react_params.context, list):
+            yield self.create_retriever_resource_message(
+                retriever_resources=[
+                    ToolInvokeMessage.RetrieverResourceMessage.RetrieverResource(
+                        content=ctx.content,
+                        position=ctx.metadata.get("position"),
+                        dataset_id=ctx.metadata.get("dataset_id"),
+                        dataset_name=ctx.metadata.get("dataset_name"),
+                        document_id=ctx.metadata.get("document_id"),
+                        document_name=ctx.metadata.get("document_name"),
+                        data_source_type=ctx.metadata.get("document_data_source_type"),
+                        segment_id=ctx.metadata.get("segment_id"),
+                        retriever_from=ctx.metadata.get("retriever_from"),
+                        score=ctx.metadata.get("score"),
+                        hit_count=ctx.metadata.get("segment_hit_count"),
+                        word_count=ctx.metadata.get("segment_word_count"),
+                        segment_position=ctx.metadata.get("segment_position"),
+                        index_node_hash=ctx.metadata.get("segment_index_node_hash"),
+                        page=ctx.metadata.get("page"),
+                        doc_metadata=ctx.metadata.get("doc_metadata"),
+                    )
+                    for ctx in react_params.context
+                ],
+                context="",
+            )
+
         yield self.create_json_message(
             {
                 "execution_metadata": {
@@ -447,7 +481,7 @@ class ReActAgentStrategy(AgentStrategy):
 
         if not tool_instance:
             answer = f"there is not a tool named {tool_call_name}"
-            return answer, tool_call_args
+            return answer, tool_call_args, []
 
         if isinstance(tool_call_args, str):
             try:
@@ -461,7 +495,7 @@ class ReActAgentStrategy(AgentStrategy):
                 if len(params) > 1:
                     raise ValueError("tool call args is not a valid json string") from e
                 tool_call_args = {params[0]: tool_call_args} if len(params) == 1 else {}
-
+        tool_call_args = cast(dict[str, Any], tool_call_args)
         tool_invoke_parameters = {**tool_instance.runtime_parameters, **tool_call_args}
         try:
             tool_invoke_responses = self.session.tool.invoke(
@@ -487,7 +521,9 @@ class ReActAgentStrategy(AgentStrategy):
                     # Pass through the original IMAGE_LINK response for upper layer handling
                     additional_messages.append(response)
                     # Include the actual file path information for the LLM
-                    image_link_text = cast(ToolInvokeMessage.TextMessage, response.message).text
+                    image_link_text = cast(
+                        ToolInvokeMessage.TextMessage, response.message
+                    ).text
                     result += (
                         f"Image has been successfully generated and saved to: {image_link_text}. "
                         + "The image file is now available for download. "
@@ -502,8 +538,7 @@ class ReActAgentStrategy(AgentStrategy):
                     )
                     result += f"tool response: {text}."
                 elif response.type == ToolInvokeMessage.MessageType.BLOB:
-                    blob_message = cast(ToolInvokeMessage.BlobMessage, response.message)
-                    result += f"Generated file with mime_type: {blob_message.meta.get('mime_type', 'unknown')}. "
+                    result += "Generated file with ... "
                     additional_messages.append(response)
                 else:
                     result += f"tool response: {response.message!r}."

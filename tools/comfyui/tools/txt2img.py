@@ -1,8 +1,5 @@
-import json
 import os
 import random
-import uuid
-from copy import deepcopy
 from enum import Enum
 from typing import Any, Generator
 from dify_plugin.entities.tool import (
@@ -13,10 +10,9 @@ from dify_plugin.entities.tool import (
 )
 from dify_plugin.errors.tool import ToolProviderCredentialValidationError
 from dify_plugin import Tool
-
+from tools.comfyui_workflow import ComfyUiWorkflow
 from tools.comfyui_client import ComfyUiClient
 
-SD_TXT2IMG_OPTIONS = {}
 LORA_NODE = {
     "inputs": {
         "lora_name": "",
@@ -39,23 +35,35 @@ class ModelType(Enum):
     SD15 = 1
     SDXL = 2
     SD3 = 3
-    FLUX = 4
+    FLUX1 = 4
 
 
 class ComfyuiTxt2Img(Tool):
-    def _invoke(self, tool_parameters: dict[str, Any]) -> Generator[ToolInvokeMessage, None, None]:
+    def get_hf_key(self) -> str:
+        hf_api_key = self.runtime.credentials.get("hf_api_key")
+        if hf_api_key is None:
+            raise ToolProviderCredentialValidationError(
+                "Please input hf_api_key")
+        return hf_api_key
+
+    def _invoke(
+        self, tool_parameters: dict[str, Any]
+    ) -> Generator[ToolInvokeMessage, None, None]:
         base_url = self.runtime.credentials.get("base_url", "")
         if not base_url:
             yield self.create_text_message("Please input base_url")
         self.comfyui = ComfyUiClient(
-            base_url,
-            self.runtime.credentials.get("comfyui_api_key")
+            base_url, self.runtime.credentials.get("comfyui_api_key")
         )
         if tool_parameters.get("model"):
             self.runtime.credentials["model"] = tool_parameters["model"]
-        model = self.runtime.credentials.get("model", None)
-        if not model:
-            yield self.create_text_message("Please input model")
+        model = self.runtime.credentials.get("model", "")
+        if model == "":
+            model = self.comfyui.download_model(
+                "https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/v1-5-pruned-emaonly-fp16.safetensors",
+                "checkpoints",
+                token=self.get_hf_key()
+            )
         if model not in self.comfyui.get_checkpoints():
             raise ToolProviderCredentialValidationError(
                 f"model {model} does not exist")
@@ -67,19 +75,19 @@ class ComfyuiTxt2Img(Tool):
         height = tool_parameters.get("height", 1024)
         steps = tool_parameters.get("steps", 1)
         valid_samplers = self.comfyui.get_samplers()
-        valid_schedulers = self.comfyui.get_schedulers()
         sampler_name = tool_parameters.get("sampler_name", "euler")
         if sampler_name not in valid_samplers:
             raise ToolProviderCredentialValidationError(
-                f"sampler {sampler_name} does not exist"
+                f"Sampler {sampler_name} does not exist. Valid samplers are {valid_samplers}."
             )
-        scheduler = tool_parameters.get("scheduler", "normal")
-        if scheduler not in valid_schedulers:
+        valid_schedulers = self.comfyui.get_schedulers()
+        scheduler_name = tool_parameters.get("scheduler", "normal")
+        if scheduler_name not in valid_schedulers:
             raise ToolProviderCredentialValidationError(
-                f"scheduler {scheduler} does not exist"
+                f"Scheduler {scheduler_name} does not exist. Valid schedulers are {valid_schedulers}."
             )
         cfg = tool_parameters.get("cfg", 7.0)
-        model_type = tool_parameters.get("model_type", ModelType.SD15.name)
+        ecosystem = tool_parameters.get("ecosystem", ModelType.SD15.name)
 
         lora_list = []
         if len(tool_parameters.get("lora_names", "")) > 0:
@@ -88,111 +96,102 @@ class ComfyuiTxt2Img(Tool):
         for lora in lora_list:
             if lora not in valid_loras:
                 raise ToolProviderCredentialValidationError(
-                    f"LORA {lora} does not exist.")
+                    f"LORA {lora} does not exist."
+                )
 
         lora_strength_list = []
         if len(tool_parameters.get("lora_strengths", "")) > 0:
-            lora_strength_list = [float(x) for x in tool_parameters.get(
-                "lora_strengths").split(",")]
+            lora_strength_list = [
+                float(x) for x in tool_parameters.get("lora_strengths").split(",")
+            ]
 
-        yield from self.text2img(
-            model=model,
-            model_type=model_type,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=width,
-            height=height,
-            steps=steps,
-            sampler_name=sampler_name,
-            scheduler=scheduler,
-            cfg=cfg,
-            lora_list=lora_list,
-            lora_strength_list=lora_strength_list,
+        # make workflow json
+        current_dir = os.path.dirname(os.path.realpath(__file__))
+        workflow_template_path = os.path.join(
+            current_dir, "json", "txt2img.json")
+        is_hiresfix_enabled: bool = (
+            tool_parameters.get("hiresfix_upscale_method") != "disabled"
         )
+        if is_hiresfix_enabled:
+            workflow_template_path = os.path.join(
+                current_dir, "json", "txt2img_hiresfix.json"
+            )
+        with open(workflow_template_path) as file:
+            workflow = ComfyUiWorkflow(file.read())
 
-    def text2img(
-        self,
-        model: str,
-        model_type: str,
-        prompt: str,
-        negative_prompt: str,
-        width: int,
-        height: int,
-        steps: int,
-        sampler_name: str,
-        scheduler: str,
-        cfg: float,
-        lora_list: list,
-        lora_strength_list: list,
-    ) -> Generator[ToolInvokeMessage, None, None]:
-        """
-        generate image
-        """
-        if not SD_TXT2IMG_OPTIONS:
-            current_dir = os.path.dirname(os.path.realpath(__file__))
-            with open(os.path.join(current_dir, "txt2img.json")) as file:
-                SD_TXT2IMG_OPTIONS.update(json.load(file))
-        draw_options = deepcopy(SD_TXT2IMG_OPTIONS)
-        sampler_node = draw_options["3"]
-        prompt_node = draw_options["6"]
-        negative_prompt_node = draw_options["7"]
-        sampler_node["inputs"]["steps"] = steps
-        sampler_node["inputs"]["sampler_name"] = sampler_name
-        sampler_node["inputs"]["scheduler"] = scheduler
-        sampler_node["inputs"]["cfg"] = cfg
-        sampler_node["inputs"]["seed"] = random.randint(0, 100000000)
-        draw_options["4"]["inputs"]["ckpt_name"] = model
-        draw_options["5"]["inputs"]["width"] = width
-        draw_options["5"]["inputs"]["height"] = height
-        prompt_node["inputs"]["text"] = prompt
-        negative_prompt_node["inputs"]["text"] = negative_prompt
-        if model_type in {ModelType.SD3.name, ModelType.FLUX.name}:
-            draw_options["5"]["class_type"] = "EmptySD3LatentImage"
+        workflow.set_Ksampler(
+            "3",
+            steps,
+            sampler_name,
+            scheduler_name,
+            cfg,
+            1.0,
+            random.randint(0, 100000000),
+        )
+        workflow.set_model_loader(None, model)
+        workflow.set_property("6", "inputs/text", prompt)
+        workflow.set_property("7", "inputs/text", negative_prompt)
 
-        lora_start_id = 100
-        lora_end_id = lora_start_id + len(lora_list) - 1
+        if is_hiresfix_enabled:
+            workflow.set_Ksampler(
+                "11",
+                steps,
+                sampler_name,
+                scheduler_name,
+                cfg,
+                tool_parameters.get("hiresfix_denoise", 0.6),
+                random.randint(0, 100000000),
+            )
+
+            hiresfix_size_ratio = tool_parameters.get(
+                "hiresfix_size_ratio", 0.5)
+            workflow.set_empty_latent_image(
+                workflow.identify_node_by_class_type("EmptyLatentImage"),
+                round(width * hiresfix_size_ratio),
+                round(height * hiresfix_size_ratio),
+            )
+
+            workflow.set_property("10", "inputs/width", width)
+            workflow.set_property("10", "inputs/height", height)
+            workflow.set_property(
+                "10",
+                "inputs/upscale_method",
+                tool_parameters.get("hiresfix_upscale_method", "bilinear"),
+            )
+        else:
+            workflow.set_empty_latent_image(None, width, height)
+
+        if ecosystem in {ModelType.SD3.name, ModelType.FLUX1.name}:
+            workflow.set_property("5", "class_type", "EmptySD3LatentImage")
+
+        # add loras to workflow json
         for i, lora_name in enumerate(lora_list):
             try:
                 strength = lora_strength_list[i]
             except:
                 strength = 1.0
-            lora_node = deepcopy(LORA_NODE)
-            lora_node["inputs"]["lora_name"] = lora_name
-            lora_node["inputs"]["strength_model"] = strength
-            lora_node["inputs"]["strength_clip"] = strength
-            lora_node["inputs"]["model"][0] = str(lora_start_id+i-1)
-            lora_node["inputs"]["clip"][0] = str(lora_start_id+i-1)
-            draw_options[str(lora_start_id+i)] = lora_node
-        if len(lora_list) > 0:
-            draw_options[str(
-                lora_start_id)]["inputs"]["model"][0] = sampler_node["inputs"]["model"][0]
-            draw_options[str(
-                lora_start_id)]["inputs"]["clip"][0] = prompt_node["inputs"]["clip"][0]
-            sampler_node["inputs"]["model"][0] = str(lora_end_id)
-            prompt_node["inputs"]["clip"][0] = str(lora_end_id)
-            negative_prompt_node["inputs"]["clip"][0] = str(lora_end_id)
+            workflow.add_lora_node(
+                "3", "6", "7", lora_name, strength, strength)
 
-        if model_type == ModelType.FLUX.name:
-            last_node_id = str(10 + len(lora_list))
-            draw_options[last_node_id] = deepcopy(FluxGuidanceNode)
-            draw_options[last_node_id]["inputs"]["conditioning"][0] = "6"
-            draw_options["3"]["inputs"]["positive"][0] = last_node_id
+        if ecosystem == ModelType.FLUX1.name:
+            workflow.add_flux_guidance("3", 3.5)
+
+        # send a query to ComfyUI
         try:
-            client_id = str(uuid.uuid4())
-            result = self.comfyui.queue_prompt_image(
-                client_id, prompt=draw_options)
-            image = b""
-            for node in result:
-                for img in result[node]:
-                    if img:
-                        image = img
-                        break
-            yield self.create_blob_message(
-                blob=image,
-                meta={"mime_type": "image/png"},
-            )
+            output_images = self.comfyui.generate(workflow.json())
         except Exception as e:
-            yield self.create_text_message(f"Failed to generate image: {str(e)}")
+            raise ToolProviderCredentialValidationError(
+                f"Failed to generate image: {str(e)}"
+            )
+        for img in output_images:
+            yield self.create_blob_message(
+                blob=img["data"],
+                meta={
+                    "filename": img["filename"],
+                    "mime_type": img["mime_type"],
+                },
+            )
+        yield self.create_json_message(workflow.json())
 
     def get_runtime_parameters(self) -> list[ToolParameter]:
         parameters = [

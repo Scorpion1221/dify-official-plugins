@@ -5,6 +5,9 @@ label:
 model_type: llm
 features:
   - agent-thought
+  - tool-call
+  - vision
+  - stream-tool-call
 model_properties:
   mode: chat
   context_size: 200000
@@ -43,7 +46,7 @@ parameter_rules:
   - name: json_schema
     use_template: json_schema
 pricing:
-  input: "10.0"
-  output: "40.0"
+  input: "2.0"
+  output: "8.0"
   unit: "0.000001"
   currency: USD

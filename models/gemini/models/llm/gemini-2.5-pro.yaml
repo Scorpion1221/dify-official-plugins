@@ -4,9 +4,10 @@ label:
   en_US: Gemini 2.5 Pro
 model_type: llm
 features:
+  - tool-call
+  - multi-tool-call
   - agent-thought
   - vision
-  - tool-call
   - stream-tool-call
   - document
   - video

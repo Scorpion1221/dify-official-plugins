@@ -180,9 +180,10 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
         by the given model.
         """
         # FIXME(QuantumGhost): Multimodal output is currently limited to 
-        # the gemini-2.0-flash-experiment model. The model name is currently 
+        # the gemini-2.0-flash-experiment and
+        # gemini-2.0-flash-preview-image-generationmodel. The model name is currently 
         # hardcoded for simplicity; consider revisiting this approach for flexibility.
-        if model != "gemini-2.0-flash-exp":
+        if model != "gemini-2.0-flash-exp" and model != "gemini-2.0-flash-preview-image-generation" :
             return ["Text"]
         
         return ["Text", "Image"]
@@ -412,7 +413,7 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
                 try:
                     file_url = message_content.url
                     if file_server_url_prefix:
-                        file_url = f"{file_server_url_prefix.rstrip('/')}/files{message_content.url.split("/files")[-1]}"
+                        file_url = f"{file_server_url_prefix.rstrip('/')}/files{message_content.url.split('/files')[-1]}"
                     if not file_url.startswith("https://") and not file_url.startswith("http://"):
                         raise ValueError(f"Set FILES_URL env first!")
                     response: requests.Response = requests.get(file_url)
