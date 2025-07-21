@@ -19,7 +19,7 @@ icon_large:
 icon_small:
   en_US: icon_s_en.svg
 label:
-  en_US: Vertex AI | Google Cloud Platform
+  en_US: Vertex AI | Google Cloud Platform | Thinking
 models:
   llm:
     predefined:

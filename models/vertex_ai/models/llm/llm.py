@@ -43,7 +43,13 @@ from google.api_core import exceptions
 from google.cloud import aiplatform
 from google.oauth2 import service_account
 from google import genai
-from google.genai.types import Tool, GenerateContentConfig, GoogleSearch
+from google.genai.types import (
+    Tool, 
+    GenerateContentConfig, 
+    GoogleSearch, 
+    ThinkingConfig, 
+    ToolCodeExecution
+)
 from PIL import Image
 
 
@@ -472,6 +478,15 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             config_kwargs.pop("response_schema")
             
         dynamic_threshold = config_kwargs.pop("grounding", None)
+        
+        # Extract thinking related parameters
+        thinking_mode = config_kwargs.pop("thinking_mode", None)
+        thinking_summary = config_kwargs.pop("thinking_summary", None)
+        thinking_budget = config_kwargs.pop("thinking_budget", None)
+        
+        # Extract code execution parameter
+        code_execution = config_kwargs.pop("code_execution", None)
+        
         if stop:
             config_kwargs["stop_sequences"] = stop
         service_account_info = (
@@ -517,7 +532,13 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                 else:
                     history.append(content)
 
-        if dynamic_threshold is not None and model.startswith("gemini-2."):
+        # Use new GenAI client for Gemini 2.x models with advanced features
+        use_genai_client = (
+            model.startswith("gemini-2.") and 
+            (dynamic_threshold is not None or code_execution or thinking_mode is not None or thinking_summary is not None or thinking_budget is not None)
+        )
+        
+        if use_genai_client:
             SCOPES = [
                 "https://www.googleapis.com/auth/cloud-platform",
                 "https://www.googleapis.com/auth/generative-language"
@@ -528,15 +549,53 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             )
             client = genai.Client(credentials=credential, project=project_id, location=location, vertexai=True)
 
-            google_search_tool = Tool(google_search=GoogleSearch())
+            # Build tools list
+            tools_list = []
+            if dynamic_threshold is not None:
+                tools_list.append(Tool(google_search=GoogleSearch()))
+            if code_execution:
+                tools_list.append(Tool(code_execution=ToolCodeExecution()))
+
+            # Build thinking config
+            thinking_config = None
+            if thinking_mode is not None or thinking_summary is not None or thinking_budget is not None:
+                thinking_config_params = {}
+                if thinking_summary is not None:
+                    thinking_config_params["include_thoughts"] = thinking_summary
+                if thinking_budget is not None:
+                    thinking_config_params["thinking_budget"] = thinking_budget
+                elif thinking_mode == False:
+                    thinking_config_params["thinking_budget"] = 0
+                thinking_config = ThinkingConfig(**thinking_config_params)
+
+            # Build GenerateContentConfig
+            config_params = {
+                "response_modalities": ["TEXT"],
+                "system_instruction": system_instruction
+            }
+            
+            if tools_list:
+                config_params["tools"] = tools_list
+            if thinking_config:
+                config_params["thinking_config"] = thinking_config
+                
+            # Add other generation parameters
+            if config_kwargs.get("temperature") is not None:
+                config_params["temperature"] = config_kwargs["temperature"]
+            if config_kwargs.get("top_p") is not None:
+                config_params["top_p"] = config_kwargs["top_p"]
+            if config_kwargs.get("top_k") is not None:
+                config_params["top_k"] = config_kwargs["top_k"]
+            if config_kwargs.get("max_output_tokens") is not None:
+                config_params["max_output_tokens"] = config_kwargs["max_output_tokens"]
+            if response_schema:
+                config_params["response_schema"] = response_schema
+                config_params["response_mime_type"] = "application/json"
+
             response = client.models.generate_content(
                 model=model,
                 contents=[item.to_dict() for item in history],
-                config=GenerateContentConfig(
-                    tools=[google_search_tool],
-                    response_modalities=["TEXT"],
-                    system_instruction=system_instruction
-                )
+                config=GenerateContentConfig(**config_params)
             )
         else:
             google_model = glm.GenerativeModel(model_name=model, system_instruction=system_instruction)
@@ -564,11 +623,11 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                 tools=tools,
             )
         if stream:
-            return self._handle_generate_stream_response(model, credentials, response, prompt_messages, system_instruction)
-        return self._handle_generate_response(model, credentials, response, prompt_messages)
+            return self._handle_generate_stream_response(model, credentials, response, prompt_messages, system_instruction, use_genai_client)
+        return self._handle_generate_response(model, credentials, response, prompt_messages, use_genai_client)
 
     def _handle_generate_response(
-        self, model: str, credentials: dict, response: glm.GenerationResponse, prompt_messages: list[PromptMessage]
+        self, model: str, credentials: dict, response, prompt_messages: list[PromptMessage], use_genai_client: bool = False
     ) -> LLMResult:
         """
         Handle llm response
@@ -577,13 +636,106 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         :param credentials: credentials
         :param response: response
         :param prompt_messages: prompt messages
+        :param use_genai_client: whether using new GenAI client
         :return: llm response
         """
         assistant_prompt_message = AssistantPromptMessage(content="", tool_calls=[])
-        part = response.candidates[0].content.parts[0]
-        if part.function_call:
-            tool_call = [
-                AssistantPromptMessage.ToolCall(
+        
+        if use_genai_client:
+            # Handle new GenAI client response format
+            content_parts = []
+            thinking_content = ""
+            executable_codes = []
+            execution_results = []
+            final_text = ""
+            
+            # Extract candidates from response
+            candidates = None
+            
+            # Handle different response formats
+            if hasattr(response, 'candidates') and response.candidates:
+                # Standard format
+                candidates = response.candidates
+            else:
+                # Try to iterate through response to find candidates
+                try:
+                    for item in response:
+                        if isinstance(item, tuple) and len(item) == 2:
+                            key, value = item
+                            if key == 'candidates' and value:
+                                candidates = value
+                                break
+                except (TypeError, ValueError):
+                    # If iteration fails, try direct access
+                    pass
+            
+            if candidates and len(candidates) > 0:
+                candidate = candidates[0]
+                if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                    for part in candidate.content.parts:
+                        # Handle thinking content
+                        if hasattr(part, 'thought') and part.thought and hasattr(part, 'text') and part.text:
+                            thinking_content += part.text
+                        
+                        # Handle executable code
+                        elif hasattr(part, 'executable_code') and part.executable_code:
+                            if hasattr(part.executable_code, 'code'):
+                                executable_codes.append(part.executable_code.code)
+                        
+                        # Handle code execution results
+                        elif hasattr(part, 'code_execution_result') and part.code_execution_result:
+                            if hasattr(part.code_execution_result, 'output'):
+                                execution_results.append(part.code_execution_result.output)
+                        
+                        # Handle regular text content
+                        elif hasattr(part, 'text') and part.text and not hasattr(part, 'thought'):
+                            final_text += part.text
+                        
+                        # Handle function calls
+                        elif hasattr(part, 'function_call') and part.function_call:
+                            tool_call = AssistantPromptMessage.ToolCall(
+                                id=part.function_call.name,
+                                type="function",
+                                function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                                    name=part.function_call.name,
+                                    arguments=json.dumps(dict(part.function_call.args.items())),
+                                ),
+                            )
+                            assistant_prompt_message.tool_calls.append(tool_call)
+            
+            # Build the complete content
+            content_text = ""
+            
+            # Add thinking content if present
+            if thinking_content:
+                content_text += f"{thinking_content}\n\n"
+            
+            # Add code sections if present
+            if executable_codes:
+                for code in executable_codes:
+                    content_text += f"```python\n{code}\n```\n"
+                content_text += "\n"
+            
+            # Add execution results if present
+            if execution_results:
+                content_text += "Code Execution Result：\n"
+                for result in execution_results:
+                    content_text += f"{result}\n"
+                content_text += "\n"
+            
+            # Add final answer
+            if final_text:
+                if thinking_content or executable_codes or execution_results:
+                    content_text += final_text
+                else:
+                    content_text = final_text
+            
+            assistant_prompt_message.content = content_text
+        else:
+            # Handle original glm response format
+            part = response.candidates[0].content.parts[0]
+            if part.function_call:
+                tool_call = AssistantPromptMessage.ToolCall(
                     id=part.function_call.name,
                     type="function",
                     function=AssistantPromptMessage.ToolCall.ToolCallFunction(
@@ -591,10 +743,9 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                         arguments=json.dumps(dict(part.function_call.args.items())),
                     ),
                 )
-            ]
-            assistant_prompt_message.tool_calls.append(tool_call)
-        elif part.text:
-            assistant_prompt_message.content = part.text
+                assistant_prompt_message.tool_calls.append(tool_call)
+            elif part.text:
+                assistant_prompt_message.content = part.text
 
         prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
         completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
@@ -603,7 +754,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         return result
 
     def _handle_generate_stream_response(
-        self, model: str, credentials: dict, response: glm.GenerationResponse, prompt_messages: list[PromptMessage], system_instruction: str
+        self, model: str, credentials: dict, response, prompt_messages: list[PromptMessage], system_instruction: str, use_genai_client: bool = False
     ) -> Generator:
         """
         Handle llm stream response
@@ -612,94 +763,204 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         :param credentials: credentials
         :param response: response
         :param prompt_messages: prompt messages
+        :param use_genai_client: whether using new GenAI client
         :return: llm response chunk generator result
         """
         index = -1
         is_first_gemini2_response = True
-        for chunk in response:
-            if isinstance(chunk, tuple):
-                key, value = chunk
-                if key == 'candidates':
-                    candidate = value[0]
-                else:
-                    continue
-            else:
-                candidate = chunk.candidates[0]
-            for part in candidate.content.parts:
+        
+        if use_genai_client:
+            # Handle new GenAI client streaming response
+            sent_thinking = False
+            sent_codes = []
+            sent_results = []
+            last_final_text_length = 0
+            
+            for chunk in response:
                 assistant_prompt_message = AssistantPromptMessage(content="", tool_calls=[])
-
-                if part.function_call:
-                    assistant_prompt_message.tool_calls.append(
-                        AssistantPromptMessage.ToolCall(
-                            id=part.function_call.name,
-                            type="function",
-                            function=AssistantPromptMessage.ToolCall.ToolCallFunction(
-                                name=part.function_call.name,
-                                arguments=json.dumps(dict(part.function_call.args.items())),
+                delta_content = ""
+                
+                # Extract candidates from chunk
+                candidates = None
+                if isinstance(chunk, tuple) and len(chunk) == 2:
+                    key, value = chunk
+                    if key == 'candidates' and value:
+                        candidates = value
+                elif hasattr(chunk, 'candidates'):
+                    candidates = chunk.candidates
+                
+                if candidates and len(candidates) > 0:
+                    candidate = candidates[0]
+                    if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                        for part in candidate.content.parts:
+                            # Handle thinking content (send once)
+                            if hasattr(part, 'thought') and part.thought and hasattr(part, 'text') and part.text and not sent_thinking:
+                                delta_content += f"{part.text}\n\n"
+                                sent_thinking = True
+                            
+                            # Handle executable code (send once per code block)
+                            elif hasattr(part, 'executable_code') and part.executable_code:
+                                if hasattr(part.executable_code, 'code'):
+                                    code = part.executable_code.code
+                                    if code not in sent_codes:
+                                        delta_content += f"```python\n{code}\n```\n\n"
+                                        sent_codes.append(code)
+                            
+                            # Handle code execution results (send once per result)
+                            elif hasattr(part, 'code_execution_result') and part.code_execution_result:
+                                if hasattr(part.code_execution_result, 'output'):
+                                    result = part.code_execution_result.output
+                                    if result not in sent_results:
+                                        delta_content += f"Code Execution Result：\n{result}\n\n"
+                                        sent_results.append(result)
+                            
+                            # Handle regular text content (incremental)
+                            elif hasattr(part, 'text') and part.text and not hasattr(part, 'thought'):
+                                # Only send the new part of the text
+                                current_text = part.text
+                                if len(current_text) > last_final_text_length:
+                                    new_text = current_text[last_final_text_length:]
+                                    if sent_thinking or sent_codes or sent_results:
+                                        if last_final_text_length == 0:
+                                            delta_content += f"{new_text}"
+                                        else:
+                                            delta_content += new_text
+                                    else:
+                                        delta_content += new_text
+                                    last_final_text_length = len(current_text)
+                            
+                            # Handle function calls
+                            elif hasattr(part, 'function_call') and part.function_call:
+                                tool_call = AssistantPromptMessage.ToolCall(
+                                    id=part.function_call.name,
+                                    type="function",
+                                    function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                                        name=part.function_call.name,
+                                        arguments=json.dumps(dict(part.function_call.args.items())),
+                                    ),
+                                )
+                                assistant_prompt_message.tool_calls.append(tool_call)
+                
+                assistant_prompt_message.content = delta_content
+                
+                index += 1
+                
+                # Check if this is the final chunk
+                is_final = False
+                if candidates and len(candidates) > 0:
+                    candidate = candidates[0]
+                    if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
+                        is_final = True
+                
+                # Only yield if there's actual content or it's the final chunk
+                if delta_content or assistant_prompt_message.tool_calls or is_final:
+                    if not is_final:
+                        yield LLMResultChunk(
+                            model=model,
+                            prompt_messages=prompt_messages,
+                            delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message),
+                        )
+                    else:
+                        prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
+                        completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
+                        usage = self._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
+                        
+                        yield LLMResultChunk(
+                            model=model,
+                            prompt_messages=prompt_messages,
+                            delta=LLMResultChunkDelta(
+                                index=index,
+                                message=assistant_prompt_message,
+                                finish_reason=str(candidate.finish_reason),
+                                usage=usage,
                             ),
                         )
-                    )
-                elif part.text:
-                    assistant_prompt_message.content += part.text
-
-                index += 1
-                if not hasattr(candidate, "finish_reason") or not candidate.finish_reason:
-                    yield LLMResultChunk(
-                        model=model,
-                        prompt_messages=prompt_messages,
-                        delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message),
-                    )
+        else:
+            # Handle original glm streaming response
+            for chunk in response:
+                if isinstance(chunk, tuple):
+                    key, value = chunk
+                    if key == 'candidates':
+                        candidate = value[0]
+                    else:
+                        continue
                 else:
-                    prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
-                    completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
-                    usage = self._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
+                    candidate = chunk.candidates[0]
+                for part in candidate.content.parts:
+                    assistant_prompt_message = AssistantPromptMessage(content="", tool_calls=[])
 
-                    reference_lines = []
-                    grounding_chunks = None
-                    try:
-                        grounding_chunks = candidate.grounding_metadata.grounding_chunks
-                    except AttributeError:
+                    if part.function_call:
+                        assistant_prompt_message.tool_calls.append(
+                            AssistantPromptMessage.ToolCall(
+                                id=part.function_call.name,
+                                type="function",
+                                function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                                    name=part.function_call.name,
+                                    arguments=json.dumps(dict(part.function_call.args.items())),
+                                ),
+                            )
+                        )
+                    elif part.text:
+                        assistant_prompt_message.content += part.text
+
+                    index += 1
+                    if not hasattr(candidate, "finish_reason") or not candidate.finish_reason:
+                        yield LLMResultChunk(
+                            model=model,
+                            prompt_messages=prompt_messages,
+                            delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message),
+                        )
+                    else:
+                        prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
+                        completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
+                        usage = self._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
+
+                        reference_lines = []
+                        grounding_chunks = None
                         try:
-                            candidate_dict = chunk.candidates[0].to_dict()
-                            grounding_chunks = candidate_dict.get("grounding_metadata", {}).get("grounding_chunks", [])
-                        except Exception:
-                            grounding_chunks = []
-
-                    if grounding_chunks:
-                        for gc in grounding_chunks:
+                            grounding_chunks = candidate.grounding_metadata.grounding_chunks
+                        except AttributeError:
                             try:
-                                title = gc.web.title
-                                uri = gc.web.uri
-                            except AttributeError:
-                                web_info = gc.get("web", {})
-                                title = web_info.get("title")
-                                uri = web_info.get("uri")
-                            if title and uri:
-                                reference_lines.append(f"<li><a href='{uri}'>{title}</a></li>")
+                                candidate_dict = chunk.candidates[0].to_dict()
+                                grounding_chunks = candidate_dict.get("grounding_metadata", {}).get("grounding_chunks", [])
+                            except Exception:
+                                grounding_chunks = []
 
-                    if reference_lines:
-                        reference_lines.insert(0, "<ol>")
-                        reference_lines.append("</ol>")
-                        reference_section = "\n\nGrounding Sources\n" + "\n".join(reference_lines)
-                    else:
-                        reference_section = ""
-                    if is_first_gemini2_response and model.startswith("gemini-2.") and system_instruction:
-                        integrated_text = f"{assistant_prompt_message.content}"
-                        is_first_gemini2_response = False
-                    else:
-                        integrated_text = f"{assistant_prompt_message.content}{reference_section}"
-                    assistant_message_with_refs = AssistantPromptMessage(content=integrated_text, tool_calls=assistant_prompt_message.tool_calls)
+                        if grounding_chunks:
+                            for gc in grounding_chunks:
+                                try:
+                                    title = gc.web.title
+                                    uri = gc.web.uri
+                                except AttributeError:
+                                    web_info = gc.get("web", {})
+                                    title = web_info.get("title")
+                                    uri = web_info.get("uri")
+                                if title and uri:
+                                    reference_lines.append(f"<li><a href='{uri}'>{title}</a></li>")
 
-                    yield LLMResultChunk(
-                        model=model,
-                        prompt_messages=prompt_messages,
-                        delta=LLMResultChunkDelta(
-                            index=index,
-                            message=assistant_message_with_refs,
-                            finish_reason=str(candidate.finish_reason),
-                            usage=usage,
-                        ),
-                    )
+                        if reference_lines:
+                            reference_lines.insert(0, "<ol>")
+                            reference_lines.append("</ol>")
+                            reference_section = "\n\nGrounding Sources\n" + "\n".join(reference_lines)
+                        else:
+                            reference_section = ""
+                        if is_first_gemini2_response and model.startswith("gemini-2.") and system_instruction:
+                            integrated_text = f"{assistant_prompt_message.content}"
+                            is_first_gemini2_response = False
+                        else:
+                            integrated_text = f"{assistant_prompt_message.content}{reference_section}"
+                        assistant_message_with_refs = AssistantPromptMessage(content=integrated_text, tool_calls=assistant_prompt_message.tool_calls)
+
+                        yield LLMResultChunk(
+                            model=model,
+                            prompt_messages=prompt_messages,
+                            delta=LLMResultChunkDelta(
+                                index=index,
+                                message=assistant_message_with_refs,
+                                finish_reason=str(candidate.finish_reason),
+                                usage=usage,
+                            ),
+                        )
 
     def _convert_one_message_to_text(self, message: PromptMessage) -> str:
         """
