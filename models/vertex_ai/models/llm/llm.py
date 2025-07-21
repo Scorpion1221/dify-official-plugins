@@ -592,11 +592,20 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                 config_params["response_schema"] = response_schema
                 config_params["response_mime_type"] = "application/json"
 
-            response = client.models.generate_content(
-                model=model,
-                contents=[item.to_dict() for item in history],
-                config=GenerateContentConfig(**config_params)
-            )
+            if stream:
+                # For streaming with the new GenAI client, we need to use generate_content_stream
+                # The chat session approach shown in the examples doesn't support our advanced features
+                response = client.models.generate_content_stream(
+                    model=model,
+                    contents=[item.to_dict() for item in history],
+                    config=GenerateContentConfig(**config_params)
+                )
+            else:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=[item.to_dict() for item in history],
+                    config=GenerateContentConfig(**config_params)
+                )
         else:
             google_model = glm.GenerativeModel(model_name=model, system_instruction=system_instruction)
 
@@ -674,8 +683,9 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                 if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
                     for part in candidate.content.parts:
                         # Handle thinking content
-                        if hasattr(part, 'thought') and part.thought and hasattr(part, 'text') and part.text:
-                            thinking_content += part.text
+                        if hasattr(part, 'thought') and part.thought:
+                            if hasattr(part, 'text') and part.text:
+                                thinking_content += part.text
                         
                         # Handle executable code
                         elif hasattr(part, 'executable_code') and part.executable_code:
@@ -731,6 +741,22 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                     content_text = final_text
             
             assistant_prompt_message.content = content_text
+            
+            # Try to get usage metadata from the new GenAI client response
+            prompt_tokens = 0
+            completion_tokens = 0
+            
+            if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                if hasattr(response.usage_metadata, 'prompt_token_count') and response.usage_metadata.prompt_token_count:
+                    prompt_tokens = response.usage_metadata.prompt_token_count
+                if hasattr(response.usage_metadata, 'candidates_token_count') and response.usage_metadata.candidates_token_count:
+                    completion_tokens = response.usage_metadata.candidates_token_count
+            
+            # Fallback to token counting if usage metadata is not available
+            if prompt_tokens == 0:
+                prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
+            if completion_tokens == 0:
+                completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
         else:
             # Handle original glm response format
             part = response.candidates[0].content.parts[0]
@@ -747,8 +773,9 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             elif part.text:
                 assistant_prompt_message.content = part.text
 
-        prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
-        completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
+            prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
+            completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
+            
         usage = self._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
         result = LLMResult(model=model, prompt_messages=prompt_messages, message=assistant_prompt_message, usage=usage)
         return result
@@ -770,64 +797,44 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         is_first_gemini2_response = True
         
         if use_genai_client:
-            # Handle new GenAI client streaming response
-            sent_thinking = False
-            sent_codes = []
-            sent_results = []
-            last_final_text_length = 0
-            
+            # Handle new GenAI client streaming response from generate_content_stream
             for chunk in response:
                 assistant_prompt_message = AssistantPromptMessage(content="", tool_calls=[])
                 delta_content = ""
                 
-                # Extract candidates from chunk
+                # Handle generate_content_stream response format
+                # The chunk should have candidates attribute directly
                 candidates = None
-                if isinstance(chunk, tuple) and len(chunk) == 2:
-                    key, value = chunk
-                    if key == 'candidates' and value:
-                        candidates = value
-                elif hasattr(chunk, 'candidates'):
+                if hasattr(chunk, 'candidates') and chunk.candidates:
                     candidates = chunk.candidates
+                elif isinstance(chunk, dict) and 'candidates' in chunk:
+                    candidates = chunk['candidates']
                 
+                # If we have candidates, process them properly to avoid warnings
                 if candidates and len(candidates) > 0:
                     candidate = candidates[0]
-                    if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                    if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts'):
                         for part in candidate.content.parts:
-                            # Handle thinking content (send once)
-                            if hasattr(part, 'thought') and part.thought and hasattr(part, 'text') and part.text and not sent_thinking:
-                                delta_content += f"{part.text}\n\n"
-                                sent_thinking = True
+                            # Handle thinking content
+                            if hasattr(part, 'thought') and part.thought:
+                                if hasattr(part, 'text') and part.text:
+                                    delta_content += f"{part.text}\n\n"
                             
-                            # Handle executable code (send once per code block)
+                            # Handle executable code
                             elif hasattr(part, 'executable_code') and part.executable_code:
                                 if hasattr(part.executable_code, 'code'):
                                     code = part.executable_code.code
-                                    if code not in sent_codes:
-                                        delta_content += f"```python\n{code}\n```\n\n"
-                                        sent_codes.append(code)
+                                    delta_content += f"```python\n{code}\n```\n\n"
                             
-                            # Handle code execution results (send once per result)
+                            # Handle code execution results
                             elif hasattr(part, 'code_execution_result') and part.code_execution_result:
                                 if hasattr(part.code_execution_result, 'output'):
                                     result = part.code_execution_result.output
-                                    if result not in sent_results:
-                                        delta_content += f"Code Execution Result：\n{result}\n\n"
-                                        sent_results.append(result)
+                                    delta_content += f"Code Execution Result：\n{result}\n\n"
                             
-                            # Handle regular text content (incremental)
-                            elif hasattr(part, 'text') and part.text and not hasattr(part, 'thought'):
-                                # Only send the new part of the text
-                                current_text = part.text
-                                if len(current_text) > last_final_text_length:
-                                    new_text = current_text[last_final_text_length:]
-                                    if sent_thinking or sent_codes or sent_results:
-                                        if last_final_text_length == 0:
-                                            delta_content += f"{new_text}"
-                                        else:
-                                            delta_content += new_text
-                                    else:
-                                        delta_content += new_text
-                                    last_final_text_length = len(current_text)
+                            # Handle regular text content - this is the main case for most responses
+                            elif hasattr(part, 'text') and part.text:
+                                delta_content += part.text
                             
                             # Handle function calls
                             elif hasattr(part, 'function_call') and part.function_call:
@@ -840,41 +847,68 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                                     ),
                                 )
                                 assistant_prompt_message.tool_calls.append(tool_call)
-                
-                assistant_prompt_message.content = delta_content
-                
-                index += 1
-                
-                # Check if this is the final chunk
-                is_final = False
-                if candidates and len(candidates) > 0:
-                    candidate = candidates[0]
+                    
+                    assistant_prompt_message.content = delta_content
+                    
+                    index += 1
+                    
+                    # Check if this is the final chunk
+                    is_final = False
+                    finish_reason = None
                     if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
                         is_final = True
-                
-                # Only yield if there's actual content or it's the final chunk
-                if delta_content or assistant_prompt_message.tool_calls or is_final:
-                    if not is_final:
-                        yield LLMResultChunk(
-                            model=model,
-                            prompt_messages=prompt_messages,
-                            delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message),
-                        )
-                    else:
-                        prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
-                        completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
-                        usage = self._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
-                        
-                        yield LLMResultChunk(
-                            model=model,
-                            prompt_messages=prompt_messages,
-                            delta=LLMResultChunkDelta(
-                                index=index,
-                                message=assistant_prompt_message,
-                                finish_reason=str(candidate.finish_reason),
-                                usage=usage,
-                            ),
-                        )
+                        finish_reason = str(candidate.finish_reason)
+                    
+                    # Only yield if there's actual content or it's the final chunk
+                    if delta_content or assistant_prompt_message.tool_calls or is_final:
+                        if not is_final:
+                            yield LLMResultChunk(
+                                model=model,
+                                prompt_messages=prompt_messages,
+                                delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message),
+                            )
+                        else:
+                            # Try to get usage metadata from the chunk
+                            prompt_tokens = 0
+                            completion_tokens = 0
+                            
+                            if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
+                                if hasattr(chunk.usage_metadata, 'prompt_token_count') and chunk.usage_metadata.prompt_token_count:
+                                    prompt_tokens = chunk.usage_metadata.prompt_token_count
+                                if hasattr(chunk.usage_metadata, 'candidates_token_count') and chunk.usage_metadata.candidates_token_count:
+                                    completion_tokens = chunk.usage_metadata.candidates_token_count
+                            
+                            # Fallback to token counting if usage metadata is not available
+                            if prompt_tokens == 0:
+                                prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
+                            if completion_tokens == 0:
+                                completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
+                            
+                            usage = self._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
+                            
+                            yield LLMResultChunk(
+                                model=model,
+                                prompt_messages=prompt_messages,
+                                delta=LLMResultChunkDelta(
+                                    index=index,
+                                    message=assistant_prompt_message,
+                                    finish_reason=finish_reason,
+                                    usage=usage,
+                                ),
+                            )
+                # Fallback for simple text-only responses
+                elif hasattr(chunk, 'text') and chunk.text:
+                    delta_content = chunk.text
+                    assistant_prompt_message.content = delta_content
+                    
+                    index += 1
+                    
+                    yield LLMResultChunk(
+                        model=model,
+                        prompt_messages=prompt_messages,
+                        delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message),
+                    )
+
         else:
             # Handle original glm streaming response
             for chunk in response:
@@ -911,8 +945,31 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                             delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message),
                         )
                     else:
-                        prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
-                        completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
+                        # Try to get usage metadata from the chunk for original glm format
+                        prompt_tokens = 0
+                        completion_tokens = 0
+                        
+                        if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
+                            if hasattr(chunk.usage_metadata, 'prompt_token_count'):
+                                prompt_tokens = chunk.usage_metadata.prompt_token_count
+                            if hasattr(chunk.usage_metadata, 'candidates_token_count'):
+                                completion_tokens = chunk.usage_metadata.candidates_token_count
+                        elif isinstance(chunk, tuple):
+                            # Check if it's a tuple format with usage metadata
+                            for item in chunk:
+                                if hasattr(item, 'usage_metadata') and item.usage_metadata:
+                                    if hasattr(item.usage_metadata, 'prompt_token_count'):
+                                        prompt_tokens = item.usage_metadata.prompt_token_count
+                                    if hasattr(item.usage_metadata, 'candidates_token_count'):
+                                        completion_tokens = item.usage_metadata.candidates_token_count
+                                    break
+                        
+                        # Fallback to token counting if usage metadata is not available
+                        if prompt_tokens == 0:
+                            prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
+                        if completion_tokens == 0:
+                            completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
+                        
                         usage = self._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
 
                         reference_lines = []
