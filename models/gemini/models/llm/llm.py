@@ -287,14 +287,14 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
                 contents=history,
                 config=config,
             )
-            return self._handle_generate_stream_response(model, credentials, response, prompt_messages)
+            return self._handle_generate_stream_response(model, credentials, response, prompt_messages, model_parameters)
 
         response = genai_client.models.generate_content(
             model=model,
             contents=history,
             config=config,
         )
-        return self._handle_generate_response(model, credentials, response, prompt_messages)
+        return self._handle_generate_response(model, credentials, response, prompt_messages, model_parameters)
 
     def _convert_one_message_to_text(self, message: PromptMessage) -> str:
         """
@@ -446,6 +446,7 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
             credentials: dict,
             response: types.GenerateContentResponse,
             prompt_messages: list[PromptMessage],
+            model_parameters: Mapping[str, Any],
     ) -> LLMResult:
         """
         Handle llm response
@@ -454,10 +455,15 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
         :param credentials: credentials
         :param response: response
         :param prompt_messages: prompt messages
+        :param model_parameters: model parameters
         :return: llm response
         """
         # transform assistant message to prompt message
-        assistant_prompt_message = AssistantPromptMessage(content=response.text)
+        if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+            show_code_execution_output = model_parameters.get("code_execution_output", False)
+            assistant_prompt_message = self._parse_parts(response.candidates[0].content.parts, show_code_execution_output=show_code_execution_output)
+        else:
+            assistant_prompt_message = AssistantPromptMessage(content=response.text)
 
         # calculate num tokens
         if response.usage_metadata:
@@ -491,6 +497,7 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
             credentials: dict,
             response: Iterator[types.GenerateContentResponse],
             prompt_messages: list[PromptMessage],
+            model_parameters: Mapping[str, Any],
     ) -> Generator[LLMResultChunk]:
         """
         Handle llm stream response
@@ -512,7 +519,8 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
                 if not candidate.content or not candidate.content.parts:
                     continue
 
-                message = self._parse_parts(candidate.content.parts)
+                show_code_execution_output = model_parameters.get("code_execution_output", False)
+                message = self._parse_parts(candidate.content.parts, show_code_execution_output=show_code_execution_output)
                 index += len(candidate.content.parts)
                 if chunk.usage_metadata:
                     prompt_tokens += chunk.usage_metadata.prompt_token_count or 0
@@ -591,18 +599,18 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
             ],
         }
 
-    def _parse_parts(self, parts: Sequence[types.Part], /) -> AssistantPromptMessage:
+    def _parse_parts(self, parts: Sequence[types.Part], /, show_code_execution_output: bool = True) -> AssistantPromptMessage:
         contents: list[PromptMessageContent] = []
         function_calls = []
         for part in parts:
             if part.text:
                 contents.append(TextPromptMessageContent(data=part.text))
-            if part.executable_code:
+            if part.executable_code and show_code_execution_output:
                 # Handle executable code from code execution
                 executable_code = part.executable_code
                 code_text = f"\n\n```{executable_code.language.lower()}\n{executable_code.code}\n```\n\n"
                 contents.append(TextPromptMessageContent(data=code_text))
-            if part.code_execution_result:
+            if part.code_execution_result and show_code_execution_output:
                 # Handle code execution result
                 result = part.code_execution_result
                 if result.outcome == "OUTCOME_OK":

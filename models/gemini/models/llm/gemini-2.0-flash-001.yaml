@@ -47,6 +47,16 @@ parameter_rules:
       ja_JP: 計算とデータ分析のためのPythonコード実行を有効にします
     required: false
     default: false
+  - name: code_execution_output
+    label:
+      zh_Hans: 代码执行输出
+      en_US: Code Execution Output
+    type: boolean
+    default: false
+    required: false
+    help:
+      zh_Hans: 控制代码执行结果是否展示。
+      en_US: Controls the code execution output display.
   - name: json_schema
     use_template: json_schema
 pricing:

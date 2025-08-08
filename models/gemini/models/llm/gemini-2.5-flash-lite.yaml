@@ -1,7 +1,7 @@
 # https://ai.google.dev/gemini-api/docs/models#gemini-2.5-flash-preview
-model: gemini-2.5-flash-lite-preview-06-17
+model: gemini-2.5-flash-lite
 label:
-  en_US: Gemini 2.5 Flash Lite Preview 06-17
+  en_US: Gemini 2.5 Flash Lite
 model_type: llm
 features:
   - tool-call
@@ -69,8 +69,6 @@ parameter_rules:
     default: 8192
     min: 1
     max: 64000
-  - name: json_schema
-    use_template: json_schema
   - name: grounding
     label:
       en_US: Grounding
@@ -81,6 +79,30 @@ parameter_rules:
       ja_JP: Google検索に基づいた応答をします。
     required: true
     default: false
+  - name: code_execution
+    label:
+      en_US: Code Execution
+      zh_Hans: 代码执行
+      ja_JP: コード実行
+    type: boolean
+    help:
+      en_US: Enable Python code execution for calculations and data analysis
+      zh_Hans: 启用 Python 代码执行功能，用于计算和数据分析
+      ja_JP: 計算とデータ分析のためのPythonコード実行を有効にします
+    required: false
+    default: false
+  - name: code_execution_output
+    label:
+      zh_Hans: 代码执行输出
+      en_US: Code Execution Output
+    type: boolean
+    default: false
+    required: false
+    help:
+      zh_Hans: 控制代码执行结果是否展示。
+      en_US: Controls the code execution output display.
+  - name: json_schema
+    use_template: json_schema
 pricing:
   input: '0.10'
   output: '0.40'
